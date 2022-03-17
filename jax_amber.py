@@ -499,7 +499,7 @@ def ener_nonbonded_pair (atom_types, mask_nonbond_pairs, sigma, epsilon, chgs):
         R (n_atom, 3)
         return rr (n_atom, n_atom)
         """
-        rr = np.linalg.norm (R.reshape(-1,1,3)-R, axis=2)
+        rr = jnp.linalg.norm (R.reshape(-1,1,3)-R, axis=2)
 
         return rr
 
@@ -546,14 +546,10 @@ if __name__ == '__main__':
     mask_nonbond_pairs = prm_get_mask_nonbond_pairs (prm_raw_data)
     ener_nonbonded_fn = ener_nonbonded_pair (atom_types, mask_nonbond_pairs,  
                                             sigma, epsilon, chgs)
+    ener_nonbonded_fn = jax.jit(ener_nonbonded_fn)
 
     #sys.exit()
-    #scee0  = jnp.float32(1.0)
-    #scnb0  = jnp.float32(1.0)
-    #ener_nonbonded_fn = ener_nonbonded (nbond_pairs, nbond_types, 
-    #                                sigma, epsilon, chgs, scee0, scnb0)
-
-    #ener_nonbonded_fn = jax.jit(ener_nonbonded_fn)
+    #
     
 
     l_PDB = True
