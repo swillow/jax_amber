@@ -94,30 +94,26 @@ def prm_get_nonbond_terms (prm_raw_data):
 
 
 
-def prm_get_nonbond_pairs (prm_raw_data):
+def prm_get_mask_nonbond_pairs (prm_raw_data):
     num_excl_atoms = prm_raw_data['NUMBER_EXCLUDED_ATOMS']
     excl_atoms_list = prm_raw_data['EXCLUDED_ATOMS_LIST']
     total = 0
     numAtoms = int(prm_raw_data['POINTERS'][0])
-    nonbond_pairs = []
+    mask_nonbond_pairs = np.ones ( (numAtoms, numAtoms), dtype=int) == 1
         
     for iatom in range(numAtoms):
         index0 = total
         n = int (num_excl_atoms[iatom])
         total += n
         index1 = total
-        excl_list = []
         for jatom in excl_atoms_list[index0:index1]:
             j = int(jatom) - 1
-            excl_list.append(j)
-
-        for jatom in range (iatom+1, numAtoms):
-            if jatom in excl_list:
-                continue
-            nonbond_pairs.append ( [iatom, jatom] )
+            if j < 0: continue
+            mask_nonbond_pairs[iatom, j] = False
+            mask_nonbond_pairs[j, iatom] = False
+        mask_nonbond_pairs[iatom, iatom] = False
         
-    return jnp.array(nonbond_pairs)
-
+    return mask_nonbond_pairs
 
 
 def prm_get_nonbond14_info (prm_raw_data):
@@ -478,26 +474,42 @@ def ener_nonbonded14 (atom_types, nonbonds, sigma, epsilon, chgs):
     return compute_fn
 
 
-def ener_nonbonded_pair (atom_types, nonbonds, sigma, epsilon, chgs):
+def ener_nonbonded_pair (atom_types, mask_nonbond_pairs, sigma, epsilon, chgs):
 
-    at_type_a = atom_types[nonbonds[:,0]]
-    at_type_b = atom_types[nonbonds[:,1]]
-    sig_ab = 0.5*(sigma[at_type_a]+sigma[at_type_b])
-    eps_ab = np.sqrt (epsilon[at_type_a]*epsilon[at_type_b])
+    numAtoms = atom_types.shape[0]
+    
+    chg_a = np.zeros ( (numAtoms, numAtoms), dtype=np.float32)
+    chg_b = np.zeros ( (numAtoms, numAtoms), dtype=np.float32)
+    sig_ab = 0.5*(sigma[atom_types].reshape(-1,1)+sigma[atom_types])
+    eps_ab = jnp.sqrt(epsilon[atom_types].reshape(-1,1)*epsilon[atom_types])
 
-    chg_a  = jax_md.util.maybe_downcast (chgs[nonbonds[:,0]]) # chg_a (n_pair)
-    chg_b  = jax_md.util.maybe_downcast (chgs[nonbonds[:,1]])
+    
+    for iatom in range (numAtoms):
+        chg_a[iatom,:] = chgs[iatom]
+        chg_b[:,iatom] = chgs[iatom]
+    
+    chg_a = chg_a[mask_nonbond_pairs]
+    chg_b = chg_b[mask_nonbond_pairs]
+    sig_ab = sig_ab[mask_nonbond_pairs]
+    eps_ab = eps_ab[mask_nonbond_pairs]
 
+    def inter_distance (R):
+        """
+        Inter-particle distance array
+        R (n_atom, 3)
+        return rr (n_atom, n_atom)
+        """
+        rr = jnp.linalg.norm (R.reshape(-1,1,3)-R, axis=2)
+
+        return rr
 
     def compute_fn (R):
         
-        Ra = R[nonbonds[:,0]]
-        Rb = R[nonbonds[:,1]]
-        Rab= Rb - Ra
-        dr = jax_md.space.distance (Rab)
+        dr = inter_distance (R)
+        dr = dr[mask_nonbond_pairs]
 
-        U_lj = jax.vmap(nonbonded_LJ) (dr, sig_ab, eps_ab)
-        U_chg = jax.vmap (nonbonded_Coul) (dr, chg_a, chg_b)
+        U_lj = jnp.float64(0.5)*jax.vmap(nonbonded_LJ) (dr, sig_ab, eps_ab)
+        U_chg = jnp.float64(0.5)*jax.vmap (nonbonded_Coul) (dr, chg_a, chg_b)
         
         return jax_md.util.high_precision_sum(U_lj), jax_md.util.high_precision_sum(U_chg)
 
@@ -531,8 +543,8 @@ if __name__ == '__main__':
     
     
     # NONBONDED Interactions
-    nonbond_pairs = prm_get_nonbond_pairs (prm_raw_data)
-    ener_nonbonded_fn = ener_nonbonded_pair (atom_types, nonbond_pairs,  
+    mask_nonbond_pairs = prm_get_mask_nonbond_pairs (prm_raw_data)
+    ener_nonbonded_fn = ener_nonbonded_pair (atom_types, mask_nonbond_pairs,  
                                             sigma, epsilon, chgs)
     ener_nonbonded_fn = jax.jit(ener_nonbonded_fn)
 
@@ -540,7 +552,7 @@ if __name__ == '__main__':
     #
     
 
-    l_PDB = False
+    l_PDB = True
 
     if l_PDB:
         u = mda.Universe(fname_pdb)
