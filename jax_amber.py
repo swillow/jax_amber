@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax
 import jax_md
 import re
-import sys
+
 
 def amber_prmtop_load (fname_prmtop):
     ''' From openmm/wrappers/python/openmm/app/internal/amber_file_parser.py
@@ -138,6 +138,19 @@ def prm_get_nonbond14_info (prm_raw_data):
     return jnp.array(nonbond14_pairs)
 
 
+def _harmonic_interaction (r, r0, k0):
+    # U = 0.5 * k0 * (r - r0)^2
+    return jnp.float32(0.5)*k0*(r - r0)**2
+
+def _torsion_interaction (theta, cos_phase0, n0, k0):
+    # theta : torsional angle
+    # cos_phase0 = cos (theta0), where theta0 is 0 or pi
+    # U_torsion = k0 * (1 + cos (n0 theta - theta0))
+    # U_torsion = k0 * (1 + cos (n0 theta) * cos_phase0)
+
+    return k0*(1.0 + jnp.cos(n0*theta)*cos_phase0)
+
+
 def ener_bond (bonds, bond_types, rb0, kb0):
     '''
     bonds : jnp.array ( (n_bond, 2), dtype=int )
@@ -148,27 +161,16 @@ def ener_bond (bonds, bond_types, rb0, kb0):
     r0 = jax_md.util.maybe_downcast (rb0[bond_types])
     k0 = jax_md.util.maybe_downcast (kb0[bond_types])
 
-    def _bond_interaction (r):
-        # U = 0.5 * k0 * (r - r0)^2
-        return jnp.float32(0.5)*k0*(r - r0)**2
-
-    def distance (R1, R2):
-        # R1, R2 (3)
-        dR = R2 - R1
-        return jnp.sqrt (jnp.einsum('i,i->', dR, dR))
-        
-
     def compute_fn (R):
         '''
         R ((n_atom, 3),dtype=float)
         '''
-        R1 = R[bonds[:,0]] # (n_bond, 3)
-        R2 = R[bonds[:,1]]
-
+        dR = R[bonds[:,1]] - R[bonds[:,0]] # (n_bond, 3)
+        
         # r (n_bond)
-        r  = jax.vmap(distance) (R1, R2)
+        r  = jax.vmap(jax_md.space.distance) (dR)
         # en_val (n_bond)
-        en_val = _bond_interaction (r)
+        en_val = jax.vmap(_harmonic_interaction) (r, r0, k0)
 
         return jax_md.util.high_precision_sum (en_val)
 
@@ -185,32 +187,18 @@ def ener_angle (angles, angle_types, r_theta0, k_theta0):
     theta0 = jax_md.util.maybe_downcast (r_theta0[angle_types])
     k0 = jax_md.util.maybe_downcast (k_theta0[angle_types])
 
-    def _angle_interaction (theta):
-        # U = 0.5* k0 * (theta - theta0)^2
-        return jnp.float32(0.5)*k0*(theta-theta0)**2
-
-    def theta_fn (R1, R2, R3):
-        '''
-        R1, R2, R3 : jnp.array((3), dtype=float)
-        '''
-        dR21 = R1 - R2
-        dR23 = R3 - R2
-
-        cos_angle = jax_md.quantity.cosine_angle_between_two_vectors(dR21, dR23)
-        return jnp.arccos (cos_angle)
-    
     def compute_fn (R):
         '''
         R: jnp.array ( (n_atom, 3), dtype=float)
         '''
-        R1 = R[angles[:, 0]] # (n_angle, 3)
-        R2 = R[angles[:, 1]]
-        R3 = R[angles[:, 2]]
+        dR21 = R[angles[:, 0]] - R[angles[:, 1]]# (n_angle, 3)
+        dR23 = R[angles[:, 2]] - R[angles[:, 1]]
 
         # theta (n_angle)
-        theta = jax.vmap (theta_fn) (R1, R2, R3)
+        cos_angle = jax.vmap(jax_md.quantity.cosine_angle_between_two_vectors)(dR21, dR23)
+        theta = jnp.arccos (cos_angle)
         # en_val (n_angle)
-        en_val = _angle_interaction (theta)
+        en_val = jax.vmap(_harmonic_interaction) (theta, theta0, k0)
 
         return jax_md.util.high_precision_sum (en_val)
 
@@ -225,28 +213,17 @@ def ener_torsion (torsions, torsion_types, torsion_values):
     cos_phase0 : jnp.array ( (n_torsion_type), dtype=float )
     k_theta0 : jnp.array ( (n_torsion_torsion), dtype=float )
     '''
-    n_theta0, cos_phase0, k_theta0 = torsion_values
+    n_theta0, cosine_phase0, k_theta0 = torsion_values
     n0 = jax_md.util.maybe_downcast (n_theta0[torsion_types])
-    cos_phase = jax_md.util.maybe_downcast (cos_phase0[torsion_types])
+    cos_phase0 = jax_md.util.maybe_downcast (cosine_phase0[torsion_types])
     k0 = jax_md.util.maybe_downcast (k_theta0[torsion_types])
 
-    def _torsion_interaction (theta):
-        # theta : torsional angle
-        # cos_phase0 = cos (theta0), where theta0 is 0 or pi
-        # U_torsion = k0 * (1 + cos (n0 theta - theta0))
-        # U_torsion = k0 * (1 + cos (n0 theta) * cos_phase0)
-
-        return k0*(1.0 + jnp.cos(n0*theta)*cos_phase)
-
-
-    def theta_fn (R1, R2, R3, R4):
+    def theta_fn (dR12, dR23, dR34):
         '''
         Estimate torsional angle using four atoms: R1, R2, R3, R4
         R1, R2, R3, R4: jnp.array ( (3), dtype=float)
         '''
-        dR12 = R2 - R1
-        dR23 = R3 - R2
-        dR34 = R4 - R3
+        
         dRT = jnp.cross (dR12, dR23)
         dRU = jnp.cross (dR23, dR34)
         dTU = jnp.cross (dRT, dRU)
@@ -267,15 +244,14 @@ def ener_torsion (torsions, torsion_types, torsion_values):
         '''
         R: jnp.array( (n_atom, 3), dtype=float)
         '''
-        R1 = R[torsions[:,0]] # R1 (n_torsion, 3)
-        R2 = R[torsions[:,1]]
-        R3 = R[torsions[:,2]]
-        R4 = R[torsions[:,3]]
+        dR12 = R[torsions[:,1]] - R[torsions[:,0]]
+        dR23 = R[torsions[:,2]] - R[torsions[:,1]]
+        dR34 = R[torsions[:,3]] - R[torsions[:,2]]
 
         # theta (n_torsion)
-        theta = jax.vmap (theta_fn) (R1, R2, R3, R4)
+        theta = jax.vmap (theta_fn) (dR12, dR23, dR34)
         # en_val (n_torsion)
-        en_val = _torsion_interaction (theta)
+        en_val = jax.vmap(_torsion_interaction) (theta, cos_phase0, n0, k0)
 
         return jax_md.util.high_precision_sum(en_val)
     
@@ -506,6 +482,7 @@ def ener_nonbonded_pair (atom_types, nonbonds, sigma, epsilon, chgs):
 
 if __name__ == '__main__':
     import MDAnalysis as mda
+    import time 
 
     #fname_prmtop = 'complex.prmtop'
     #fname_pdb = 'complex.pdb'
@@ -536,39 +513,39 @@ if __name__ == '__main__':
                                             sigma, epsilon, chgs)
     ener_nonbonded_fn = jax.jit(ener_nonbonded_fn)
 
-    #sys.exit()
-    #
-    
 
-    l_PDB = False
+    l_PDB = True #False
 
     if l_PDB:
         u = mda.Universe(fname_pdb)
         x_Ai = jnp.array(u.atoms.positions)*jnp.float32(0.1) # A-->nm
         
+        time0 = time.perf_counter()
         en_bonded = ener_bonded_fn (x_Ai)
-        en_bond = ener_bond_fn (x_Ai)
-        print ('en_bond', en_bond/4.184)
-        print ('en_bonded', en_bonded/4.184)
-
         (en_lj, en_chg) = ener_nonbonded_fn (x_Ai)
         (en_lj14, en_chg14) = ener_nonbonded14_fn (x_Ai)
+        time1 = time.perf_counter()
+        print ('en_bonded', en_bonded/4.184)
         print ('en_nbond', en_lj/4.184, en_chg/4.184)
         print ('en_nbond14', en_lj14/4.184, en_chg14/4.184)
-    else:
+        print ("TIME", time1-time0)
+
+    l_DCD = True
+    if l_DCD:
         u = mda.Universe(fname_prmtop, fname_dcd)
         x_Ai = []
         for ts in u.trajectory:
             crds = u.atoms.positions
             x_Ai.append(crds)
     
-        x_Ai = jnp.array(x_Ai[-1000:])*jnp.float32(0.1) # A --> nm
+        x_Ai = jnp.array(x_Ai[-10000:])*jnp.float32(0.1) # A --> nm
+        time0 = time.perf_counter()
         en_bonded = jax.vmap(ener_bonded_fn) (x_Ai)
-        en_bond = jax.vmap(ener_bond_fn) (x_Ai)
-        print ('en_bond', en_bond[:5]/4.184)
-        print ('en_bonded', en_bonded[:5]/4.184)
-
         (en_lj, en_chg) = jax.vmap(ener_nonbonded_fn) (x_Ai)
         (en_lj14, en_chg14) = jax.vmap(ener_nonbonded14_fn) (x_Ai)
+        time1 = time.perf_counter()
+
+        print ('en_bonded', en_bonded[:5]/4.184)
         print ('en_nbond', en_lj[:5]/4.184, en_chg[:5]/4.184)
         print ('en_nbond14', en_lj14[:5]/4.184, en_chg14[:5]/4.184)
+        print ('TIME', time1-time0)
