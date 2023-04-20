@@ -1,9 +1,10 @@
 import numpy as np
 import jax.numpy as jnp
 import jax
-import jax_md
 import re
+import sys
 
+_ONE_4PI_EPS0 = jnp.float32(138.935456)
 
 def amber_prmtop_load (fname_prmtop):
     ''' From openmm/wrappers/python/openmm/app/internal/amber_file_parser.py
@@ -93,7 +94,6 @@ def prm_get_nonbond_terms (prm_raw_data):
 
 
 
-
 def prm_get_nonbond_pairs (prm_raw_data):
     num_excl_atoms = prm_raw_data['NUMBER_EXCLUDED_ATOMS']
     excl_atoms_list = prm_raw_data['EXCLUDED_ATOMS_LIST']
@@ -120,6 +120,7 @@ def prm_get_nonbond_pairs (prm_raw_data):
 
 
 
+
 def prm_get_nonbond14_info (prm_raw_data):
     
     dihedralPointers = prm_raw_data["DIHEDRALS_WITHOUT_HYDROGEN"] + \
@@ -138,11 +139,38 @@ def prm_get_nonbond14_info (prm_raw_data):
     return jnp.array(nonbond14_pairs)
 
 
-def _harmonic_interaction (r, r0, k0):
+def square_distance (dR:jnp.ndarray) -> jnp.ndarray:
+    return jnp.sum(dR**2, axis=-1)
+
+
+def distance (dR:jnp.ndarray):
+    dr = square_distance(dR)
+    return jnp.sqrt(dr)
+
+def periodic_distance (Box:jnp.ndarray, dR:jnp.ndarray):
+    """
+    Args:
+    Box: Box length (ndarray(3))
+    dR : distance between two particles (ndarray(shape=[..., 3]))
+    Returns:
+    The shortest distance between two particles
+    """
+    return jnp.mod (dR+Box*jnp.float32(0.5), Box) - jnp.float32(0.5)*Box 
+
+
+def cosine_angle_between_two_vectors(dR_12: jnp.ndarray, dR_13: jnp.ndarray) -> jnp.ndarray:
+    dr_12 = distance(dR_12) + 1e-7
+    dr_13 = distance(dR_13) + 1e-7
+    cos_angle = jnp.dot(dR_12, dR_13) / dr_12 / dr_13
+    return jnp.clip(cos_angle, -1.0, 1.0)
+
+
+def harmonic_interaction (r, r0, k0):
     # U = 0.5 * k0 * (r - r0)^2
     return jnp.float32(0.5)*k0*(r - r0)**2
 
-def _torsion_interaction (theta, cos_phase0, n0, k0):
+
+def torsion_interaction (theta, cos_phase0, n0, k0):
     # theta : torsional angle
     # cos_phase0 = cos (theta0), where theta0 is 0 or pi
     # U_torsion = k0 * (1 + cos (n0 theta - theta0))
@@ -158,21 +186,21 @@ def ener_bond (bonds, bond_types, rb0, kb0):
     rb0 : jnp.array ( (n_bond_type), dtype=float )
     kb0 : jnp.array ( (n_bond_type), dtype=float )
     '''
-    r0 = jax_md.util.maybe_downcast (rb0[bond_types])
-    k0 = jax_md.util.maybe_downcast (kb0[bond_types])
+    r0 = rb0[bond_types]
+    k0 = kb0[bond_types]
 
     def compute_fn (R):
         '''
         R ((n_atom, 3),dtype=float)
         '''
-        dR = R[bonds[:,1]] - R[bonds[:,0]] # (n_bond, 3)
+        dR12 = R[bonds[:,1]] - R[bonds[:,0]] # (n_bond, 3)
         
         # r (n_bond)
-        r  = jax.vmap(jax_md.space.distance) (dR)
+        r  = jax.vmap(distance) (dR12)
         # en_val (n_bond)
-        en_val = jax.vmap(_harmonic_interaction) (r, r0, k0)
+        en_val = jax.vmap(harmonic_interaction) (r, r0, k0)
 
-        return jax_md.util.high_precision_sum (en_val)
+        return jnp.sum (en_val)
 
     return compute_fn
 
@@ -184,8 +212,8 @@ def ener_angle (angles, angle_types, r_theta0, k_theta0):
     r_theta0 : jnp.array ( (n_angle_type), dtype=float )
     k_theta0 : jnp.array ( (n_angle_torsion), dtype=float )
     '''
-    theta0 = jax_md.util.maybe_downcast (r_theta0[angle_types])
-    k0 = jax_md.util.maybe_downcast (k_theta0[angle_types])
+    theta0 = r_theta0[angle_types]
+    k0 = k_theta0[angle_types]
 
     def compute_fn (R):
         '''
@@ -195,14 +223,15 @@ def ener_angle (angles, angle_types, r_theta0, k_theta0):
         dR23 = R[angles[:, 2]] - R[angles[:, 1]]
 
         # theta (n_angle)
-        cos_angle = jax.vmap(jax_md.quantity.cosine_angle_between_two_vectors)(dR21, dR23)
-        theta = jnp.arccos (cos_angle)
+        cos_angle = jax.vmap(cosine_angle_between_two_vectors) (dR21, dR23)
+        theta = jnp.arccos(cos_angle)
         # en_val (n_angle)
-        en_val = jax.vmap(_harmonic_interaction) (theta, theta0, k0)
+        en_val = jax.vmap(harmonic_interaction) (theta, theta0, k0)
 
-        return jax_md.util.high_precision_sum (en_val)
+        return jnp.sum (en_val)
 
     return compute_fn
+
 
 
 def ener_torsion (torsions, torsion_types, torsion_values):
@@ -214,9 +243,10 @@ def ener_torsion (torsions, torsion_types, torsion_values):
     k_theta0 : jnp.array ( (n_torsion_torsion), dtype=float )
     '''
     n_theta0, cosine_phase0, k_theta0 = torsion_values
-    n0 = jax_md.util.maybe_downcast (n_theta0[torsion_types])
-    cos_phase0 = jax_md.util.maybe_downcast (cosine_phase0[torsion_types])
-    k0 = jax_md.util.maybe_downcast (k_theta0[torsion_types])
+    n0 =  n_theta0[torsion_types]
+    cos_phase0 =  cosine_phase0[torsion_types]
+    k0 =  k_theta0[torsion_types]
+
 
     def theta_fn (dR12, dR23, dR34):
         '''
@@ -228,9 +258,9 @@ def ener_torsion (torsions, torsion_types, torsion_values):
         dRU = jnp.cross (dR23, dR34)
         dTU = jnp.cross (dRT, dRU)
 
-        rt = jax_md.space.distance (dRT) + 1.e-7
-        ru = jax_md.space.distance (dRU) + 1.e-7
-        r23 = jax_md.space.distance (dR23) + 1.e-7
+        rt = distance (dRT) + 1.e-7
+        ru = distance (dRU) + 1.e-7
+        r23 = distance (dR23) + 1.e-7
 
         cos_angle = jnp.dot (dRT, dRU)/(rt*ru)
         sin_angle = jnp.dot (dR23, dTU)/(r23*rt*ru)
@@ -239,24 +269,126 @@ def ener_torsion (torsions, torsion_types, torsion_values):
         return theta
 
 
-
     def compute_fn (R):
         '''
         R: jnp.array( (n_atom, 3), dtype=float)
         '''
-        dR12 = R[torsions[:,1]] - R[torsions[:,0]]
+        dR12 = R[torsions[:,1]] - R[torsions[:,0]] # R1 (n_torsion, 3)
         dR23 = R[torsions[:,2]] - R[torsions[:,1]]
         dR34 = R[torsions[:,3]] - R[torsions[:,2]]
-
+        
         # theta (n_torsion)
         theta = jax.vmap (theta_fn) (dR12, dR23, dR34)
         # en_val (n_torsion)
-        en_val = jax.vmap(_torsion_interaction) (theta, cos_phase0, n0, k0)
+        en_val = jax.vmap(torsion_interaction) (theta, cos_phase0, n0, k0)
 
-        return jax_md.util.high_precision_sum(en_val)
+        return jnp.sum(en_val)
     
     return compute_fn
 
+
+
+def get_bonds_info (prm_raw_data):
+        
+    # kcal/mol/A^2 --> kJ/mol/nm^2
+    forceConstConversionFactor = jnp.float32 (418.4)
+    # Amber : k(r - r0)^2
+    # openmm and this code : 0.5 * k' (r - r0)^2
+    # k' = 2 * k    
+    forceConstant = jnp.float32(2.0)*jnp.array(
+            [float(k0) for k0 in prm_raw_data['BOND_FORCE_CONSTANT']] 
+        )*forceConstConversionFactor
+        
+    # A --> nm
+    lengthConversionFactor = jnp.float32 (0.1)
+    bondEquil = jnp.array(
+            [float(r0) for r0 in prm_raw_data['BOND_EQUIL_VALUE']]
+        )*lengthConversionFactor       
+        
+    bondPointers = prm_raw_data['BONDS_WITHOUT_HYDROGEN'] + \
+        prm_raw_data['BONDS_INC_HYDROGEN']
+        
+    bonds = []
+    bond_types = []
+    for ii in range (0, len(bondPointers), 3):
+        iType = int (bondPointers[ii+2]) - 1
+        bonds.append ( (int(bondPointers[ii])//3,
+                        int(bondPointers[ii+1])//3) )
+        bond_types.append(iType)
+
+    return jnp.array(bonds), \
+           jnp.array(bond_types), \
+           bondEquil, forceConstant
+
+
+
+def get_angles_info (prm_raw_data):
+
+    # kcal/mol/rad^2 --> kJ/mol/rad^2
+    forceConstConversionFactor = jnp.float32 (4.184) 
+    # Amber : k(r - r0)^2
+    # openmm and this code : 0.5 * k' (r - r0)^2
+    # k' = 2 * k
+    forceConstant = jnp.float32(2.0)*jnp.array(
+            [float(k0) for k0 in prm_raw_data['ANGLE_FORCE_CONSTANT']] 
+        )*forceConstConversionFactor
+        
+    angleEquil = jnp.array(
+            [float(r0) for r0 in prm_raw_data['ANGLE_EQUIL_VALUE']]
+        )
+        
+
+    anglePointers = prm_raw_data['ANGLES_WITHOUT_HYDROGEN'] + \
+        prm_raw_data['ANGLES_INC_HYDROGEN']
+        
+    angles = []
+    angle_types = []
+    for ii in range (0, len(anglePointers), 4):
+        iType = int (anglePointers[ii+3]) - 1
+        angles.append ( (int(anglePointers[ii]) //3,
+                        int(anglePointers[ii+1])//3,
+                        int(anglePointers[ii+2])//3) )
+        angle_types.append(iType)
+
+    return jnp.array(angles), \
+            jnp.array(angle_types),\
+            angleEquil, forceConstant
+
+
+
+def get_dihedrals_info (prm_raw_data):
+    
+    # kcal/mol/rad^2 --> kJ/mol/rad^2
+    forceConstConversionFactor = jnp.float32 (4.184) 
+    forceConstant = jnp.array(
+            [float(k0) for k0 in prm_raw_data['DIHEDRAL_FORCE_CONSTANT']] 
+        )*forceConstConversionFactor
+        
+    cos0 = jnp.array([jnp.cos(float(ph0)) for ph0 in prm_raw_data['DIHEDRAL_PHASE']])
+    cos_phase0 = jnp.where (cos0 < 0, jnp.float32(-1), jnp.float32(1.0))
+
+    periodicity = jnp.array(
+            [int (0.5 + float(n0)) for n0 in prm_raw_data['DIHEDRAL_PERIODICITY']]
+        )
+        
+    dihedralPointers = prm_raw_data['DIHEDRALS_WITHOUT_HYDROGEN'] + \
+        prm_raw_data['DIHEDRALS_INC_HYDROGEN']
+        
+    dihedrals = []
+    dihedral_types = []
+    for ii in range (0, len(dihedralPointers), 5):
+        iType = int (dihedralPointers[ii+4]) - 1
+        dihedrals.append ( (int(dihedralPointers[ii]) //3,
+                                int(dihedralPointers[ii+1])//3,
+                            abs(int(dihedralPointers[ii+2]))//3,
+                            abs(int(dihedralPointers[ii+3]))//3) )
+        dihedral_types.append(iType)
+
+    dihedral_type_values = (periodicity, cos_phase0, forceConstant)
+        
+    return jnp.array(dihedrals), \
+           jnp.array(dihedral_types), \
+           dihedral_type_values
 
 
 
@@ -265,140 +397,27 @@ def ener_bonded (prm_raw_data):
     prmtop._raw_data: dict{} : from amber prmtop file
     ener_bonded = ener_bond + ener_angle + ener_torsion
     '''
+    bonds, bond_types, r_bond0, k_bond0 = get_bonds_info(prm_raw_data)
+    ener_bond_fn = ener_bond (bonds, bond_types, r_bond0, k_bond0)
 
-    def get_bonds_info ():
-        forceConstant = []
-        for k0 in prm_raw_data['BOND_FORCE_CONSTANT']:
-            forceConstant.append (float(k0))
-        
-        bondEquil = []
-        for r0 in prm_raw_data['BOND_EQUIL_VALUE']:
-            bondEquil.append (float(r0))
-        
-        # kcal/mol/A^2 --> kJ/mol/nm^2
-        forceConstConversionFactor = jnp.float32 (418.4) 
-        # A --> nm
-        lengthConversionFactor = jnp.float32 (0.1)
-        # Amber : k(r - r0)^2
-        # openmm and this code : 0.5 * k' (r - r0)^2
-        # k' = 2 * k
-        forceConstant = jnp.float32(2.0)*jnp.array (forceConstant)*forceConstConversionFactor
-        bondEquil = jnp.array(bondEquil)*lengthConversionFactor
+    angles, angle_types, r_theta0, k_theta0 = \
+             get_angles_info(prm_raw_data)
+    ener_angle_fn = ener_angle (angles, angle_types, r_theta0, k_theta0)
 
-        bondPointers = prm_raw_data['BONDS_WITHOUT_HYDROGEN'] + \
-            prm_raw_data['BONDS_INC_HYDROGEN']
-        
-        bonds = []
-        bond_types = []
-        for ii in range (0, len(bondPointers), 3):
-            iType = int (bondPointers[ii+2]) - 1
-            bonds.append ( (int(bondPointers[ii])//3,
-                            int(bondPointers[ii+1])//3) )
-            bond_types.append(iType)
-
-        return jnp.array(bonds), jnp.array(bond_types), bondEquil, forceConstant
-
-
-    def get_angles_info ():
-        forceConstant = []
-        for k0 in prm_raw_data['ANGLE_FORCE_CONSTANT']:
-            forceConstant.append (float(k0))
-        
-        angleEquil = []
-        for r0 in prm_raw_data['ANGLE_EQUIL_VALUE']:
-            angleEquil.append (float(r0))
-        
-        # kcal/mol/rad^2 --> kJ/mol/rad^2
-        forceConstConversionFactor = jnp.float32 (4.184) 
-        
-        # Amber : k(r - r0)^2
-        # openmm and this code : 0.5 * k' (r - r0)^2
-        # k' = 2 * k
-        forceConstant = jnp.float32(2.0)*jnp.array (forceConstant)*forceConstConversionFactor
-        angleEquil = jnp.array(angleEquil)
-
-        anglePointers = prm_raw_data['ANGLES_WITHOUT_HYDROGEN'] + \
-            prm_raw_data['ANGLES_INC_HYDROGEN']
-        
-        angles = []
-        angle_types = []
-        for ii in range (0, len(anglePointers), 4):
-            iType = int (anglePointers[ii+3]) - 1
-            angles.append ( (int(anglePointers[ii]) //3,
-                            int(anglePointers[ii+1])//3,
-                            int(anglePointers[ii+2])//3) )
-            angle_types.append(iType)
-
-        return jnp.array(angles), jnp.array(angle_types), angleEquil, forceConstant
-
-
-    def get_dihedrals_info ():
-        forceConstant = []
-        for k0 in prm_raw_data['DIHEDRAL_FORCE_CONSTANT']:
-            forceConstant.append (float(k0))
-        
-        cos_phase0 = []
-        for ph0 in prm_raw_data['DIHEDRAL_PHASE']:
-            val = np.cos (float(ph0))
-            if val < 0:
-                cos_phase0.append (-1.0)
-            else:
-                cos_phase0.append (1.0)
-        
-        periodicity = []
-        for n0 in prm_raw_data['DIHEDRAL_PERIODICITY']:
-            periodicity.append (int(0.5 + float(n0)))
-        
-
-        # kcal/mol/rad^2 --> kJ/mol/rad^2
-        forceConstConversionFactor = jnp.float32 (4.184) 
-        
-        
-        forceConstant = jnp.array (forceConstant)*forceConstConversionFactor
-        cos_phase0 = jnp.array(cos_phase0)
-        periodicity = jnp.array(periodicity)
-
-
-        dihedralPointers = prm_raw_data['DIHEDRALS_WITHOUT_HYDROGEN'] + \
-            prm_raw_data['DIHEDRALS_INC_HYDROGEN']
-        
-        dihedrals = []
-        dihedral_types = []
-        for ii in range (0, len(dihedralPointers), 5):
-            iType = int (dihedralPointers[ii+4]) - 1
-            dihedrals.append ( (int(dihedralPointers[ii]) //3,
-                                int(dihedralPointers[ii+1])//3,
-                            abs(int(dihedralPointers[ii+2]))//3,
-                            abs(int(dihedralPointers[ii+3]))//3) )
-            dihedral_types.append(iType)
-
-        dihedral_type_values = (periodicity, cos_phase0, forceConstant)
-        return jnp.array(dihedrals), jnp.array(dihedral_types), dihedral_type_values
-    
-
-    def bond_energy_fn (R):
-        # Bond
-        bonds, bond_types, r0, k0 = get_bonds_info()
-        return ener_bond (bonds, bond_types, r0, k0) (R)
-
-
-    def angle_energy_fn (R):
-        # Angle
-        angles, angle_types, r_theta0, k_theta0 = get_angles_info()
-        return ener_angle (angles, angle_types, r_theta0, k_theta0) (R)
-
-
-    def torsion_energy_fn (R):
-        # Dihedral
-        dihedrals, dihedral_types, dihedral_values = get_dihedrals_info()
-        return ener_torsion (dihedrals, dihedral_types, dihedral_values) (R)
-
+    dihedrals, dihedral_types, dihedral_values = \
+            get_dihedrals_info(prm_raw_data)
+    ener_torsion_fn = ener_torsion (dihedrals, dihedral_types, dihedral_values)
 
     def compute_fn (R):
-    
-        return bond_energy_fn(R) + angle_energy_fn (R) + torsion_energy_fn (R)
 
-    return compute_fn, bond_energy_fn
+        enr_bond = ener_bond_fn (R)
+        enr_angle = ener_angle_fn (R)
+        enr_dih = ener_torsion_fn (R) 
+        
+        return enr_bond + enr_angle + enr_dih
+
+
+    return compute_fn, ener_bond_fn
 
 
 
@@ -412,14 +431,19 @@ def nonbonded_LJ (dr, sigma, epsilon):
     idr12 = idr6*idr6
 
     return jnp.nan_to_num(jnp.float32(4)*epsilon*(idr12-idr6))
+    
+
+def nonbonded_Coul (dr, chg_ij):
+    
+    return _ONE_4PI_EPS0*chg_ij/dr
+    
 
 
-def nonbonded_Coul (dr, chg_i, chg_j):
-    _ONE_4PI_EPS0 = jnp.float32(138.935456)
-    return _ONE_4PI_EPS0*chg_i*chg_j/dr
-
-
-def ener_nonbonded14 (atom_types, nonbonds, sigma, epsilon, chgs):
+def ener_nonbonded14 (atom_types, nonbonds, sigma, epsilon, chgs, 
+                      vmax0=jnp.float32(50.0),
+                      l_ewald=False,
+                      eps_ewald=jnp.float32(1.0e-6), 
+                      r_cut=jnp.float32(1.0)):
     """
     provide the nonbonded potential energy functions
     nonbonds: jnp.array ((n_pairs, 2), dtype=int) : provide pair_list
@@ -436,116 +460,132 @@ def ener_nonbonded14 (atom_types, nonbonds, sigma, epsilon, chgs):
     sig_ab = 0.5*(sigma[at_type_a]+sigma[at_type_b])
     eps_ab = np.sqrt (epsilon[at_type_a]*epsilon[at_type_b])
     
-    chg_a  = jax_md.util.maybe_downcast (chgs[nonbonds[:,0]]) # chg_a (n_pair)
-    chg_b  = jax_md.util.maybe_downcast (chgs[nonbonds[:,1]])
+    chg_ab =  chgs[nonbonds[:,0]]*chgs[nonbonds[:,1]] # chg_a (n_pair)
+    U_chg0 = jax.vmap(nonbonded_Coul) (sig_ab, chg_ab)
+    
+    pp = -jnp.log (eps_ewald)
+    aewald = jnp.sqrt (pp)/r_cut
 
     def compute_fn (R):
         # Ra and Rb (n_pairs, 3)
-        Ra = R[nonbonds[:,0]]
-        Rb = R[nonbonds[:,1]]
-        Rab= Rb - Ra
-        dr = jax_md.space.distance (Rab)
-            
+        
+        Rab = R[nonbonds[:,1]] - R[nonbonds[:,0]]
+        dr = jax.vmap(distance) (Rab)
+        
         U_lj = scnb0*jax.vmap(nonbonded_LJ) (dr, sig_ab, eps_ab)
-        U_chg = scee0*jax.vmap(nonbonded_Coul) (dr, chg_a, chg_b)
-            
-        return jax_md.util.high_precision_sum(U_lj), jax_md.util.high_precision_sum(U_chg)
+        U_chg = scee0*jax.vmap(nonbonded_Coul) (dr, chg_ab)
+        U_lj = jnp.where (dr > sig_ab, U_lj, vmax0*jnp.tanh(U_lj/vmax0))
+        U_chg = jnp.where (dr > sig_ab, U_chg, U_chg0+vmax0*jnp.tanh((U_chg-U_chg0)/vmax0))
+        if l_ewald:
+            alphaR = aewald*dr
+            U_chg = U_chg * jax.scipy.special.erfc(alphaR)
+        
+        return jnp.sum(U_lj), jnp.sum(U_chg)
 
     return compute_fn
 
 
-def ener_nonbonded_pair (atom_types, nonbonds, sigma, epsilon, chgs):
+
+def ener_nonbonded_pair (atom_types, nonbonds, sigma, epsilon, chgs, 
+                         vmax0=jnp.float32(50.0), 
+                         l_ewald=False, 
+                         switch=None, 
+                         eps_ewald=jnp.float32(1.0e-6)):
 
     at_type_a = atom_types[nonbonds[:,0]]
     at_type_b = atom_types[nonbonds[:,1]]
-    sig_ab = 0.5*(sigma[at_type_a]+sigma[at_type_b])
-    eps_ab = np.sqrt (epsilon[at_type_a]*epsilon[at_type_b])
+    sig_ab = jnp.float32(0.5)*(sigma[at_type_a]+sigma[at_type_b])
+    eps_ab = jnp.sqrt (epsilon[at_type_a]*epsilon[at_type_b])
 
-    chg_a  = jax_md.util.maybe_downcast (chgs[nonbonds[:,0]]) # chg_a (n_pair)
-    chg_b  = jax_md.util.maybe_downcast (chgs[nonbonds[:,1]])
+    chg_ab = chgs[nonbonds[:,0]]*chgs[nonbonds[:,1]] # chg_a (n_pair)
+    U_chg0 = jax.vmap(nonbonded_Coul) (sig_ab, chg_ab)
 
+    cutoff_distance = jnp.float32 (1.0) # 10 A = 1 nm
+    if switch is not None:
+        switch_distance, cutoff_distance = switch
+    
+    pp = -jnp.log (eps_ewald)
+    aewald = jnp.sqrt (pp)/cutoff_distance
 
-    def compute_fn (R):
+    def compute_fn (R, Box=None): 
         
-        Ra = R[nonbonds[:,0]]
-        Rb = R[nonbonds[:,1]]
-        Rab= Rb - Ra
-        dr = jax_md.space.distance (Rab)
+        Rab = R[nonbonds[:,1]] - R[nonbonds[:,0]]
+        if Box is None:
+            dr = jax.vmap(distance) (Rab)
+        else:
+            dr = jax.vmap(periodic_distance) (Rab)
 
         U_lj = jax.vmap(nonbonded_LJ) (dr, sig_ab, eps_ab)
-        U_chg = jax.vmap (nonbonded_Coul) (dr, chg_a, chg_b)
+        U_chg = jax.vmap (nonbonded_Coul) (dr, chg_ab)
         
-        return jax_md.util.high_precision_sum(U_lj), jax_md.util.high_precision_sum(U_chg)
+        if switch is None:
+            U_lj = jnp.where (dr > sig_ab, U_lj, vmax0*jnp.tanh(U_lj/vmax0))
+            U_chg = jnp.where (dr > sig_ab, U_chg, U_chg0+vmax0*jnp.tanh((U_chg-U_chg0)/vmax0))
+        else:
+            tmp = (dr - switch_distance)/(cutoff_distance - switch_distance)
+            svalue = 1 + tmp*tmp*tmp*(-10+tmp*(15-tmp*6))
+
+            U_lj = jnp.where (dr > sig_ab, U_lj, vmax0*jnp.tanh(U_lj/vmax0))
+            U_lj = jnp.where (dr < cutoff_distance, U_lj, jnp.float32(0.0))
+            U_lj = jnp.where (dr < switch_distance, U_lj, U_lj*svalue)
+
+            U_chg = jnp.where (dr > sig_ab, U_chg, U_chg0 + vmax0*jnp.tanh((U_chg-U_chg0)/vmax0))
+            U_chg = jnp.where (dr < cutoff_distance, U_chg, jnp.float32(0.0))
+            U_chg = jnp.where (dr < switch_distance, U_chg, U_chg*svalue)
+            if l_ewald:
+                alphaR = aewald*dr
+                U_chg = U_chg * jax.scipy.special.erfc(alphaR)
+        
+        return jnp.sum(U_lj), jnp.sum(U_chg)
 
     return compute_fn
 
 
-if __name__ == '__main__':
-    import MDAnalysis as mda
-    import time 
-
-    #fname_prmtop = 'complex.prmtop'
-    #fname_pdb = 'complex.pdb'
-    fname_dcd = 'traj_complex.dcd'
+def get_amber_energy_funs (fname_prmtop):
     
-    fname_prmtop = 'da.prmtop'
-    fname_pdb ='da_nvt.pdb'
-
-    prm_raw_data = amber_prmtop_load(fname_prmtop)
+    prm_raw_data = amber_prmtop_load (fname_prmtop)
     ener_bonded_fn, ener_bond_fn = ener_bonded (prm_raw_data)
     ener_bonded_fn = jax.jit (ener_bonded_fn)
+    ener_bond_fn = jax.jit (ener_bond_fn)
 
     chgs = prm_get_charges (prm_raw_data)
+    atom_types = prm_get_atom_types (prm_raw_data)
     sigma, epsilon = prm_get_nonbond_terms (prm_raw_data)
     
-    # NONBONDED 14 Interactions
-    atom_types = prm_get_atom_types (prm_raw_data)
-    nbond14_pairs = prm_get_nonbond14_info (prm_raw_data)
-    
-    ener_nonbonded14_fn = ener_nonbonded14 (atom_types, nbond14_pairs, 
-                                            sigma, epsilon, chgs)
-    ener_nonbonded14_fn = jax.jit(ener_nonbonded14_fn)
-    
-    
-    # NONBONDED Interactions
     nonbond_pairs = prm_get_nonbond_pairs (prm_raw_data)
-    ener_nonbonded_fn = ener_nonbonded_pair (atom_types, nonbond_pairs,  
-                                            sigma, epsilon, chgs)
-    ener_nonbonded_fn = jax.jit(ener_nonbonded_fn)
+    ener_nbond_fn = ener_nonbonded_pair (atom_types, nonbond_pairs,
+                                        sigma, epsilon, chgs)
+    ener_nbond_fn = jax.jit(ener_nbond_fn)
 
+    nbonds14 = prm_get_nonbond14_info (prm_raw_data)
+    ener_nbond14_fn = ener_nonbonded14 (atom_types, nbonds14,  
+                                                sigma, epsilon, chgs)
+    ener_nbond14_fn = jax.jit(ener_nbond14_fn)
 
-    l_PDB = True #False
-
-    if l_PDB:
-        u = mda.Universe(fname_pdb)
-        x_Ai = jnp.array(u.atoms.positions)*jnp.float32(0.1) # A-->nm
+    def compute_fun (R):
+        """
+        R (natom, 3)
+        """
+        en_bonded = ener_bonded_fn (R)
+        en_lj, en_chg = ener_nbond_fn (R)
+        en_lj14, en_chg14 = ener_nbond14_fn (R)
         
-        time0 = time.perf_counter()
-        en_bonded = ener_bonded_fn (x_Ai)
-        (en_lj, en_chg) = ener_nonbonded_fn (x_Ai)
-        (en_lj14, en_chg14) = ener_nonbonded14_fn (x_Ai)
-        time1 = time.perf_counter()
-        print ('en_bonded', en_bonded/4.184)
-        print ('en_nbond', en_lj/4.184, en_chg/4.184)
-        print ('en_nbond14', en_lj14/4.184, en_chg14/4.184)
-        print ("TIME", time1-time0)
-
-    l_DCD = True
-    if l_DCD:
-        u = mda.Universe(fname_prmtop, fname_dcd)
-        x_Ai = []
-        for ts in u.trajectory:
-            crds = u.atoms.positions
-            x_Ai.append(crds)
+        return en_bonded + en_lj + en_chg + en_lj14 + en_chg14
     
-        x_Ai = jnp.array(x_Ai[-10000:])*jnp.float32(0.1) # A --> nm
-        time0 = time.perf_counter()
-        en_bonded = jax.vmap(ener_bonded_fn) (x_Ai)
-        (en_lj, en_chg) = jax.vmap(ener_nonbonded_fn) (x_Ai)
-        (en_lj14, en_chg14) = jax.vmap(ener_nonbonded14_fn) (x_Ai)
-        time1 = time.perf_counter()
+    
+    return compute_fun, ener_bond_fn, nonbond_pairs
 
-        print ('en_bonded', en_bonded[:5]/4.184)
-        print ('en_nbond', en_lj[:5]/4.184, en_chg[:5]/4.184)
-        print ('en_nbond14', en_lj14[:5]/4.184, en_chg14[:5]/4.184)
-        print ('TIME', time1-time0)
+
+if __name__ == '__main__':
+    import mdtraj as md
+
+    fname_dcd = 'test/L200/traj_complex_short.dcd'
+    fname_prmtop = 'test/ala_deca_peptide.prmtop'
+
+    c = md.load (fname_dcd, top=fname_prmtop)
+    crds = jnp.array (c.xyz) # lenght unit is nm
+
+    ener_fun, _, _ = get_amber_energy_funs (fname_prmtop)
+    enr = jax.vmap (ener_fun) (crds)
+    print ('<E>(kJ/mol) {:12.6f}'.format(enr.mean()))
+    

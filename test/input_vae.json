@@ -1,0 +1,39 @@
+{
+    "fixed" : { 
+        "_kval_unit" : "kJ/mol/nm^2",
+        "_length_unit" : "nm",
+        "_dF0 " : "kJ/mol",
+        "kval" : 20000.0,
+        "atoms": [5, 97],
+        "R0_A":  [0.0, 0.0, 1.8],
+        "R0_B":  [0.0, 0.0, 2.0]
+    },
+    "fname_prmtop": "test/ala_deca_peptide.prmtop",
+    "fname_dcd_A": "test/L180/traj_complex_short.dcd",
+    "fname_dcd_B": "test/L200/traj_complex_short.dcd",
+    "VAE_RNVP": {
+        "latents": 3
+    },
+    "realNVP": {
+        "hidden_dim": 128,
+        "hidden_layers": 10,
+        "mask_fixed" : [5]
+    },
+    "restart_nn": {
+        "run": true,
+        "fname_nn_pkl": "test/DMAP_VAE/restart_nn_test.pkl"
+    },
+    "fname_log":    "test/VAE_RNVP/out.log",
+    "fname_mA_dcd": "test/VAE_RNVP/traj_mA.dcd",
+    "fname_mB_dcd": "test/VAE_RNVP/traj_mB.dcd",
+    "fname_nn_pkl": "test/VAE_RNVP/restart_nn.pkl",
+    "fname_nn_test_pkl": "test/VAE_RNVP/restart_nn_test.pkl",
+    "random_seed": 2,
+    "optax": {
+        "learning_rate": 1.0e-4,
+        "total_steps": 10000,
+        "alpha": 0.8
+    },
+    "nsamp" :  2000,
+    "nepoch" : 3000
+}
