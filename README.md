@@ -22,5 +22,7 @@ Estimate the Amber Potential Energy using jax with the following features
 
 * HOWTO:
 > python model_dmap.py test/input_dmap.py
+
 > python model_rnvp.py test/input_rnvp.py
+
 > python model_vae.py test/input_vae.py
