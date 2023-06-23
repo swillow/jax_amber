@@ -18,7 +18,7 @@ Estimate the Amber Potential Energy using jax with the following features
 
 * model_rnvp.py : Train the end states using the Amber potential energies (Boltzmann distribution). The key reason of the failure of the correct free energy estimation with the Amber potential energies is many potential energy barriers between end states that the minimization cannot cross over.
 
-* model_vae.py : This is the same scheme as model_rnvp.py. But the neural network parameters in real NVP are based on VAE (Auto-Enconding with Variational Bayes). 
+* model_vae.py : This is the same scheme as model_rnvp.py. But the neural network parameters in real NVP are based on VAE (Auto-Enconding with Variational Bayes: https://github.com/google/flax/tree/main/examples/vae/). 
 
 * HOWTO:
 > python model_dmap.py test/input_dmap.py
