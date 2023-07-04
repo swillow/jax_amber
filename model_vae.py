@@ -205,7 +205,7 @@ def main_train (json_data):
                                             decay_steps=total_steps,
                                             alpha=alpha)
     opt_method = optax.chain (
-        optax.clip(0.5),
+        optax.clip(2.0),
         optax.adam (learning_rate=scheduler)
     )
     #opt_method = optax.adam (learning_rate=scheduler)

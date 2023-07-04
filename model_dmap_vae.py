@@ -44,9 +44,9 @@ def ener_restraint_fun (R_fixed, R_fixed0, kval):
     return enr
 
 def get_energy_values (x, ener_funs, R1, mu, std):
-    ener_step1_fun, ener_bond_fun = ener_funs 
+    ener_dmap_fun, ener_bond_fun = ener_funs 
     enr_bnd = jax.vmap(ener_bond_fun) (x)
-    enr_step1 = jax.vmap(ener_step1_fun, in_axes=(0,None,None,None)) (x, R1, mu, std)
+    enr_step1 = jax.vmap(ener_dmap_fun, in_axes=(0,None,None,None)) (x, R1, mu, std)
     
     return enr_bnd, enr_step1
 
@@ -105,7 +105,7 @@ def kl_divergence(means, logvars):
     return jnp.sum(x_kl + y_kl + z_kl)
 
 
-def loss_value_step1 (ener_step1_fn, ener_bond_fn, enr0,
+def loss_value_step1 (ener_dmap_fn, ener_bond_fn, enr0,
                       m_B, log_J_F, m_A, log_J_R, 
                       fixed_R0, means, scales):
     
@@ -113,8 +113,8 @@ def loss_value_step1 (ener_step1_fn, ener_bond_fn, enr0,
     R0_A, R0_B = fixed_R0
     mu_A, mu_B = means
     std_A, std_B = scales 
-    enr_A = jax.vmap (ener_step1_fn, in_axes=(0,None,None,None)) (m_A, R0_A, mu_A, std_A)
-    enr_B = jax.vmap (ener_step1_fn, in_axes=(0,None,None,None)) (m_B, R0_B, mu_B, std_B)
+    enr_A = jax.vmap (ener_dmap_fn, in_axes=(0,None,None,None)) (m_A, R0_A, mu_A, std_A)
+    enr_B = jax.vmap (ener_dmap_fn, in_axes=(0,None,None,None)) (m_B, R0_B, mu_B, std_B)
     enr_bnd_A = jax.vmap(ener_bond_fn) (m_A)
     enr_bnd_B = jax.vmap(ener_bond_fn) (m_B)
 
@@ -132,7 +132,7 @@ def loss_value_step1 (ener_step1_fn, ener_bond_fn, enr0,
 
 
 def get_current_loss_values (state, inputs, inputs_test, 
-                             ener_step1_fun, ener_bond_fun, 
+                             ener_dmap_fun, ener_bond_fun, 
                              ener_ref0, ener_ref0_test,
                              fixed_R0, means, scales, z_rng):
 
@@ -142,13 +142,13 @@ def get_current_loss_values (state, inputs, inputs_test,
     m_B, log_J_F, _, _ = state.apply_fn ({'params':state.params}, tx_A, z_rng)
     m_A, log_J_R, _, _ = state.apply_fn ({'params':state.params}, tx_B, z_rng, reverse=True)
 
-    _, loss_test = loss_value_step1 (ener_step1_fun, ener_bond_fun, ener_ref0_test,
+    _, loss_test = loss_value_step1 (ener_dmap_fun, ener_bond_fun, ener_ref0_test,
                              m_B, log_J_F, m_A, log_J_R, 
                              fixed_R0, means, scales)
     m_B, log_J_F, _, _ = state.apply_fn ({'params':state.params}, x_A, z_rng)
     m_A, log_J_R, _, _ = state.apply_fn ({'params':state.params}, x_B, z_rng, reverse=True)
 
-    loss_wBnd, loss = loss_value_step1 (ener_step1_fun, ener_bond_fun, ener_ref0,
+    loss_wBnd, loss = loss_value_step1 (ener_dmap_fun, ener_bond_fun, ener_ref0,
                              m_B, log_J_F, m_A, log_J_R, 
                              fixed_R0, means, scales)
     
@@ -181,7 +181,7 @@ def main_train (json_data):
         jax_amber.get_amber_energy_funs (json_data['fname_prmtop'])
 
     
-    def get_ener_step1_fun (fixed_atoms, kval):
+    def get_ener_dmap_fun (fixed_atoms, kval):
         iatom = fixed_atoms[0]
         jatom = fixed_atoms[1]
         R0 = jnp.array ([0.0, 0.0, 0.0])
@@ -200,8 +200,8 @@ def main_train (json_data):
         return compute_fun 
     
     
-    ener_step1_fun = get_ener_step1_fun (fixed_atoms, kval)
-    ener_funs = (ener_step1_fun, ener_bond_fun) 
+    ener_dmap_fun = get_ener_dmap_fun (fixed_atoms, kval)
+    ener_funs = (ener_dmap_fun, ener_bond_fun) 
 
     
     # dist_A0 (nconf, npair)
@@ -240,7 +240,7 @@ def main_train (json_data):
                                             decay_steps=total_steps,
                                             alpha=alpha)
     opt_method = optax.chain (
-        optax.clip(0.5),
+        optax.clip(2.0),
         optax.adam (learning_rate=scheduler)
     )
     #opt_method = optax.adam (learning_rate=scheduler)
@@ -277,7 +277,7 @@ def main_train (json_data):
             m_B, log_J_F, means_F, logvars_F = apply_fn ({'params':params}, b_A, z_rng)
             m_A, log_J_R, means_R, logvars_R = apply_fn ({'params':params}, b_B, z_rng, reverse=True)
 
-            loss_wBnd, loss = loss_value_step1 (ener_step1_fun, ener_bond_fun, ener_batch_ref0,
+            loss_wBnd, loss = loss_value_step1 (ener_dmap_fun, ener_bond_fun, ener_batch_ref0,
                     m_B, log_J_F, m_A, log_J_R, fixed_R0, means, scales)
             
             kld_loss_F = kl_divergence (means_F, logvars_F).mean()
@@ -309,7 +309,7 @@ def main_train (json_data):
 
     loss_old, _, loss_test_min, _ = \
         get_current_loss_values (state, inputs, inputs_test, 
-                                 ener_step1_fun, ener_bond_fun,
+                                 ener_dmap_fun, ener_bond_fun,
                                  ener_ref0, ener_ref0_test,
                                  fixed_R0, means, scales, z_rng)
     
@@ -335,15 +335,15 @@ def main_train (json_data):
             
             loss_Wbnd, loss, loss_test, (m_A, m_B) = \
                 get_current_loss_values (state, inputs, inputs_test, 
-                                 ener_step1_fun, ener_bond_fun,
+                                 ener_dmap_fun, ener_bond_fun,
                                  ener_ref0, ener_ref0_test,
                                  fixed_R0, means, scales, z_rng)
                 
             diff = loss_Wbnd - loss_old 
             loss_old = loss_Wbnd
 
-            enr_gA = jax.vmap (ener_step1_fun, in_axes=(0,None,None,None))(m_A, R0_A, mu_A, std_A)
-            enr_gB = jax.vmap (ener_step1_fun, in_axes=(0,None,None,None))(m_B, R0_B, mu_B, std_B)
+            enr_gA = jax.vmap (ener_dmap_fun, in_axes=(0,None,None,None))(m_A, R0_A, mu_A, std_A)
+            enr_gB = jax.vmap (ener_dmap_fun, in_axes=(0,None,None,None))(m_B, R0_B, mu_B, std_B)
             enr_gA = enr_gA.mean()
             enr_gB = enr_gB.mean()
                 
@@ -386,7 +386,7 @@ def main_train (json_data):
             
         
         
-    ckpt = {'params': state.params, 'opt_state': state.opt_state}
+    ckpt = {'params': state.params, 'opt_state': state.opt_state, 'z_rng':z_rng}
     checkpoint_save (json_data['fname_nn_pkl'], ckpt)
     checkpoint_save (json_data['fname_nn_test_pkl'], test_ckpt)
 

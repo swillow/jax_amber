@@ -35,5 +35,5 @@
         "alpha": 0.8
     },
     "nsamp" :  2000,
-    "nepoch" : 3000
+    "nepoch" : 5000
 }
