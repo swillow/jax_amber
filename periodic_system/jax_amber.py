@@ -56,6 +56,11 @@ def prm_get_charges (prm_raw_data):
     return jnp.array(charge_list)
 
 
+def prm_get_masses (prm_raw_data):
+    mass_list = [float(x) for x in prm_raw_data['MASS']]
+    return jnp.array(mass_list)
+
+
 def prm_get_atom_types (prm_raw_data):
     atomType = [ int(x) - 1 for x in prm_raw_data['ATOM_TYPE_INDEX']]
     return jnp.array (atomType)
@@ -440,7 +445,6 @@ def nonbonded_Coul (dr, chg_ij):
 
 
 def ener_nonbonded14 (atom_types, nonbonds, sigma, epsilon, chgs, 
-                      vmax0=jnp.float32(50.0),
                       l_pbc=False,
                       l_ewald=False,
                       eps_ewald=jnp.float32(1.0e-6), 
@@ -462,7 +466,6 @@ def ener_nonbonded14 (atom_types, nonbonds, sigma, epsilon, chgs,
     eps_ab = np.sqrt (epsilon[at_type_a]*epsilon[at_type_b])
     
     chg_ab =  chgs[nonbonds[:,0]]*chgs[nonbonds[:,1]] # chg_a (n_pair)
-    U_chg0 = jax.vmap(nonbonded_Coul) (sig_ab, chg_ab)
     
     cutoff_distance = jnp.float32 (1.0)
     pp = -jnp.log (eps_ewald)
@@ -476,8 +479,6 @@ def ener_nonbonded14 (atom_types, nonbonds, sigma, epsilon, chgs,
         
         U_lj = scnb0*jax.vmap(nonbonded_LJ) (dr, sig_ab, eps_ab)
         U_chg = scee0*jax.vmap(nonbonded_Coul) (dr, chg_ab)
-        U_lj = jnp.where (dr > sig_ab, U_lj, vmax0*jnp.tanh(U_lj/vmax0))
-        U_chg = jnp.where (dr > sig_ab, U_chg, U_chg0+vmax0*jnp.tanh((U_chg-U_chg0)/vmax0))
         if l_pbc:
             U_lj = jnp.where (dr < cutoff_distance, U_lj, 0.0)
             U_chg = jnp.where (dr < cutoff_distance, U_chg, 0.0)
@@ -493,8 +494,7 @@ def ener_nonbonded14 (atom_types, nonbonds, sigma, epsilon, chgs,
 
 
 def ener_nonbonded_pair (atom_types, nonbonds, sigma, epsilon, chgs, 
-                         vmax0=jnp.float32(50.0), 
-                         l_pbc = False,
+                         l_pbc=False,
                          l_ewald=False, 
                          eps_ewald=jnp.float32(1.0e-6)):
 
@@ -504,11 +504,36 @@ def ener_nonbonded_pair (atom_types, nonbonds, sigma, epsilon, chgs,
     eps_ab = jnp.sqrt (epsilon[at_type_a]*epsilon[at_type_b])
 
     chg_ab = chgs[nonbonds[:,0]]*chgs[nonbonds[:,1]] # chg_a (n_pair)
-    U_chg0 = jax.vmap(nonbonded_Coul) (sig_ab, chg_ab)
-
     cutoff_distance = jnp.float32 (1.0) # 10 A = 1 nm
+    
     pp = -jnp.log (eps_ewald)
     aewald = jnp.sqrt (pp)/cutoff_distance
+
+    @jax.jit
+    def compute_batch_cutoff_fn (dr, _sig_ab, _eps_ab, _chg_ab):
+        
+        U_lj = jnp.where (dr < cutoff_distance, 
+                              nonbonded_LJ(dr, _sig_ab, _eps_ab), 
+                              jnp.float32(0.0))
+        
+        U_chg = jnp.where (dr < cutoff_distance, 
+                               nonbonded_Coul(dr, _chg_ab), jnp.float32(0.0))
+        
+        if l_ewald:
+            alphaR = aewald*dr
+            U_chg = U_chg * jax.scipy.special.erfc(alphaR)
+
+        return jnp.sum(U_lj), jnp.sum(U_chg)
+    
+    
+    
+    @jax.jit
+    def compute_batch_fn (dr, _sig_ab, _eps_ab, _chg_ab):
+        U_lj = jax.vmap(nonbonded_LJ) (dr, _sig_ab, _eps_ab)
+        U_chg = jax.vmap (nonbonded_Coul) (dr, _chg_ab)
+        
+        return jnp.sum(U_lj), jnp.sum(U_chg)
+    
 
     def compute_fn (R, Box=None): 
         
@@ -517,72 +542,96 @@ def ener_nonbonded_pair (atom_types, nonbonds, sigma, epsilon, chgs,
             Rab = jax.vmap(periodic_distance, in_axes=(0,None)) (Rab, Box)
         
         dr = jax.vmap(distance) (Rab)
-        
-
-        U_lj = jax.vmap(nonbonded_LJ) (dr, sig_ab, eps_ab)
-        U_chg = jax.vmap (nonbonded_Coul) (dr, chg_ab)
-        
-        U_lj = jnp.where (dr > sig_ab, U_lj, vmax0*jnp.tanh(U_lj/vmax0))
-        U_chg = jnp.where (dr > sig_ab, U_chg, U_chg0+vmax0*jnp.tanh((U_chg-U_chg0)/vmax0))
+        U_lj = 0.0
+        U_chg = 0.0
+        npair = dr.shape[0]
         
         if l_pbc:
-            U_lj = jnp.where (dr < cutoff_distance, U_lj, jnp.float32(0.0))
-            U_chg = jnp.where (dr < cutoff_distance, U_chg, jnp.float32(0.0))
+            for ist0 in range (0, npair, 10000):
+                ied0 = ist0 + 10000
+                ied0 = jnp.where (ied0 < npair, ied0, npair)
+                en_lj, en_chg = compute_batch_cutoff_fn(dr[ist0:ied0],
+                                                sig_ab[ist0:ied0],
+                                                eps_ab[ist0:ied0],
+                                                chg_ab[ist0:ied0])
+                                                
+
+                U_lj += en_lj
+                U_chg += en_chg 
+        else:
+
+            for ist0 in range (0, npair, 10000):
+                ied0 = ist0 + 10000
+                ied0 = jnp.where (ied0 < npair, ied0, npair)
+                en_lj, en_chg = compute_batch_fn(dr[ist0:ied0],
+                                                        sig_ab[ist0:ied0],
+                                                        eps_ab[ist0:ied0],
+                                                        chg_ab[ist0:ied0])
+
+                U_lj += en_lj
+                U_chg += en_chg 
+
             
-            if l_ewald:
-                alphaR = aewald*dr
-                U_chg = U_chg * jax.scipy.special.erfc(alphaR)
-        
-        return jnp.sum(U_lj), jnp.sum(U_chg)
+        return U_lj, U_chg
 
     return compute_fn
 
 
-def get_amber_energy_funs (fname_prmtop, l_pbc=False):
+def get_amber_energy_fun (fname_prmtop, l_pbc=False):
+    
     
     prm_raw_data = amber_prmtop_load (fname_prmtop)
     ener_bonded_fn, ener_bond_fn = ener_bonded (prm_raw_data)
     ener_bonded_fn = jax.jit (ener_bonded_fn)
     ener_bond_fn = jax.jit (ener_bond_fn)
 
+    masses = prm_get_masses (prm_raw_data)
     chgs = prm_get_charges (prm_raw_data)
     atom_types = prm_get_atom_types (prm_raw_data)
     sigma, epsilon = prm_get_nonbond_terms (prm_raw_data)
     
     nonbond_pairs = prm_get_nonbond_pairs (prm_raw_data)
     ener_nbond_fn = ener_nonbonded_pair (atom_types, nonbond_pairs,
-                                        sigma, epsilon, chgs, l_pbc=l_pbc)
-    ener_nbond_fn = jax.jit(ener_nbond_fn)
+                                        sigma, epsilon, chgs,
+                                        l_pbc=l_pbc)
+                                        
+    #ener_nbond_fn = jax.jit(ener_nbond_fn)
 
-    nbonds14 = prm_get_nonbond14_info (prm_raw_data)
-    ener_nbond14_fn = ener_nonbonded14 (atom_types, nbonds14,  
+    nonbonds14 = prm_get_nonbond14_info (prm_raw_data)
+    ener_nbond14_fn = ener_nonbonded14 (atom_types, nonbonds14,  
                                         sigma, epsilon, chgs, l_pbc=l_pbc)
     ener_nbond14_fn = jax.jit(ener_nbond14_fn)
 
-    def compute_fun (R):
+    def compute_fun (R, box=None):
         """
         R (natom, 3)
         """
         en_bonded = ener_bonded_fn (R)
-        en_lj, en_chg = ener_nbond_fn (R)
+        en_lj, en_chg = ener_nbond_fn (R, box)
         en_lj14, en_chg14 = ener_nbond14_fn (R)
         
         return en_bonded + en_lj + en_chg + en_lj14 + en_chg14
     
     
-    return compute_fun, ener_bond_fn, nonbond_pairs
+    return compute_fun, masses
 
 
 if __name__ == '__main__':
     import mdtraj as md
 
-    fname_dcd = 'test/L200/traj_complex_short.dcd'
-    fname_prmtop = 'test/ala_deca_peptide.prmtop'
+    
+    fname_prmtop = 'ala_deca_peptide_wat.prmtop'
+    fname_pdb    = 'ala_deca_peptide_wat.pdb'
+    
+    c = md.load (fname_pdb, top=fname_prmtop)
+    crds = jnp.array (c.xyz[0]) # lenght unit is nm
+    print (crds.shape)
+    ener_fun, _ = get_amber_energy_fun (fname_prmtop, l_pbc=True)
+    box = jnp.array([3.0, 3.0, 4.5])
+    
+    ener_grad_fun = jax.value_and_grad (ener_fun)
+    enr, grd = ener_grad_fun (crds, box)
+    print ('<E>(kJ/mol) {:12.6f}'.format(enr))
+    print ('Grd(kJ/(nm mol) )', grd[:3])
 
-    c = md.load (fname_dcd, top=fname_prmtop)
-    crds = jnp.array (c.xyz) # lenght unit is nm
-
-    ener_fun, _, _ = get_amber_energy_funs (fname_prmtop)
-    enr = jax.vmap (ener_fun) (crds)
-    print ('<E>(kJ/mol) {:12.6f}'.format(enr.mean()))
     
