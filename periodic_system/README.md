@@ -6,4 +6,5 @@
 
 * HOWTO:
 > python jax_amber.py
+
 > python bomd.py
