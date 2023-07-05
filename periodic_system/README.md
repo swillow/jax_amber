@@ -1,6 +1,6 @@
-# JAX_AMBER FOR PERIODIC SYSTEMS
+# JAX_AMBER FOR SYSTEMS UNDER PBC
 
-* Perform the molecular dynamics simulations (NVT) using jax_amber for periodic systems.
+* Perform the NVT molecular dynamics simulations for systems under the periodic boundary conditions using jax_amber.
 
 * It is slow in comparison with OpenMM and other MM packages.
 
