@@ -212,7 +212,13 @@ def main_train (json_data):
     hidden_dim = json_data['realNVP']['hidden_dim']
     hidden_layers=json_data['realNVP']['hidden_layers']
     mask_fixed = jnp.array(json_data['realNVP']['mask_fixed']) - 1
-    model = flax_nn.realNVP3(input_size=input_size, 
+    if json_data['realNVP']['ndim'] == 3:
+        model = flax_nn.realNVP3(input_size=input_size, 
+                     hidden_layers=hidden_layers,
+                     hidden_dim=hidden_dim,
+                     fixed_atoms=mask_fixed)
+    else:
+        model = flax_nn.realNVP2(input_size=input_size, 
                      hidden_layers=hidden_layers,
                      hidden_dim=hidden_dim,
                      fixed_atoms=mask_fixed)

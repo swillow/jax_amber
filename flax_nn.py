@@ -16,6 +16,44 @@ TinyVolt/normalizing-flows
 """
 
 
+class AfflineCoupling_2D(nn.Module):
+    input_size: int 
+    i_even: int 
+    hidden_layers: int 
+    hidden_dim : int 
+    fixed_atoms: Sequence[int]
+
+    @nn.compact
+    def __call__ (self, inputs, reverse=False):
+
+        fixed_mask = jnp.ones ((self.input_size), dtype=jnp.int32).reshape(-1,2)
+        fixed_mask = fixed_mask.at[:,self.i_even].set(0)
+        moved_mask = jnp.int32(1) - fixed_mask
+        moved_mask = moved_mask.reshape(-1,3)
+        moved_mask = moved_mask.at[self.fixed_atoms,0].set(0)
+        moved_mask = moved_mask.at[self.fixed_atoms,1].set(0)
+        moved_mask = moved_mask.at[self.fixed_atoms,2].set(0)
+        moved_mask = moved_mask.reshape (1,-1)
+        fixed_mask = fixed_mask.reshape (1,-1)
+        y = inputs*fixed_mask
+        
+        for _ in range (self.hidden_layers):
+            y = nn.relu (nn.Dense (features=self.hidden_dim, kernel_init=default_kernel_init) (y))
+    
+        log_scale = nn.Dense (features=self.input_size, kernel_init=nn_zeros) (y)
+        shift     = nn.Dense (features=self.input_size, kernel_init=nn_zeros) (y)
+        shift     = shift*moved_mask 
+        log_scale = log_scale*moved_mask
+        
+        if reverse:
+            log_scale = -log_scale
+            outputs = (inputs-shift)*jnp.exp(log_scale)
+        else:
+            outputs = inputs*jnp.exp(log_scale) + shift
+      
+        return outputs, log_scale 
+
+
 class AfflineCoupling(nn.Module):
     input_size: int 
     i_dim: int 
@@ -120,6 +158,39 @@ class VAE (nn.Module):
 
         return recon_x, log_scale, z_mean, z_logvar 
     
+
+
+class realNVP2 (nn.Module):
+    input_size: int 
+    hidden_layers: int 
+    hidden_dim : int 
+    fixed_atoms: Sequence[int]
+    
+    def setup (self):
+        
+        self.af_0 = AfflineCoupling_2D (self.input_size, i_even=0, 
+                                     hidden_layers=self.hidden_layers, 
+                                     hidden_dim=self.hidden_dim,
+                                     fixed_atoms=self.fixed_atoms)
+        self.af_1 = AfflineCoupling_2D (self.input_size, i_even=1, 
+                                     hidden_layers=self.hidden_layers, 
+                                     hidden_dim=self.hidden_dim,
+                                     fixed_atoms=self.fixed_atoms)
+        
+    @nn.compact
+    def __call__ (self, inputs, reverse=False):
+        n_conf, n_atoms, n_dim = inputs.shape 
+        
+        outputs = inputs.reshape (n_conf, -1)
+        if reverse:
+            outputs, log_J_1 = self.af_1 (outputs, reverse)
+            outputs, log_J_0 = self.af_0 (outputs, reverse)
+        else:
+            outputs, log_J_0 = self.af_0 (outputs)
+            outputs, log_J_1 = self.af_1 (outputs)
+            
+        return outputs.reshape(n_conf, n_atoms, n_dim), \
+                (log_J_0 + log_J_1).sum(axis=-1)
 
 
 class realNVP3 (nn.Module):
