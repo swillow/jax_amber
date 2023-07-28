@@ -26,15 +26,12 @@ class AfflineCoupling_2D(nn.Module):
     @nn.compact
     def __call__ (self, inputs, reverse=False):
 
-        fixed_mask = jnp.ones ((self.input_size), dtype=jnp.int32).reshape(-1,2)
-        fixed_mask = fixed_mask.at[:,self.i_even].set(0)
+        fixed_mask = (jnp.arange (self.input_size)+self.i_even)%2
+        fixed_mask = fixed_mask.reshape(-1,3)
+        fixed_mask = fixed_mask.at[self.fixed_atoms].set(1)
+        fixed_mask = fixed_mask.reshape(1,-1)
         moved_mask = jnp.int32(1) - fixed_mask
-        moved_mask = moved_mask.reshape(-1,3)
-        moved_mask = moved_mask.at[self.fixed_atoms,0].set(0)
-        moved_mask = moved_mask.at[self.fixed_atoms,1].set(0)
-        moved_mask = moved_mask.at[self.fixed_atoms,2].set(0)
-        moved_mask = moved_mask.reshape (1,-1)
-        fixed_mask = fixed_mask.reshape (1,-1)
+        
         y = inputs*fixed_mask
         
         for _ in range (self.hidden_layers):
@@ -66,10 +63,10 @@ class AfflineCoupling(nn.Module):
 
         fixed_mask = jnp.ones ((self.input_size), dtype=jnp.int32).reshape(-1,3)
         fixed_mask = fixed_mask.at[:,self.i_dim].set(0)
-        moved_mask = jnp.int32(1) - fixed_mask
-        moved_mask = moved_mask.at[self.fixed_atoms,self.i_dim].set(0)
-        moved_mask = moved_mask.reshape (1,-1)
+        fixed_mask = fixed_mask.at[self.fixed_atoms].set (1)
         fixed_mask = fixed_mask.reshape (1,-1)
+        moved_mask = jnp.int32(1) - fixed_mask
+        
         y = inputs*fixed_mask
         
         for _ in range (self.hidden_layers):
