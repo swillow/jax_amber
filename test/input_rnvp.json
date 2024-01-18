@@ -14,7 +14,8 @@
     "realNVP": {
         "hidden_dim": 128,
         "hidden_layers": 10,
-        "mask_fixed" : [5]
+        "mask_fixed" : [5],
+        "ndim": 3
     },
     "restart_nn": {
         "run": true,
