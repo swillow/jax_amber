@@ -18,7 +18,7 @@
         "ndim": 3
     },
     "restart_nn": {
-        "run": true,
+        "run": false,
         "fname_nn_pkl": "test/DMAP/restart_nn.pkl"
     },
     "fname_log":    "test/RNVP/out.log",
